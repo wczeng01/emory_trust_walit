@@ -1,0 +1,52 @@
+[tool.poetry]
+name = "langserve-trust"
+version = "0.1.0"
+description = "LangServe wrapper for TRUST"
+authors = ["You <you@example.com>"]
+packages = [{ include = "trust_adapter" }]
+
+[tool.poetry.dependencies]
+python = "^3.10"
+langserve = {version = "*", extras=["all"]}
+langchain = "*"
+fastapi = "*"
+uvicorn = "*"
+pydantic = "^2.0"
+
+[tool.poetry.scripts]
+serve = "uvicorn:main"
+
+[tool.poetry.group.dev.dependencies]
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "trust-all"
+version = "0.1.0"
+description = "TRUST + LangServe adapter"
+readme = "README.md"
+requires-python = ">=3.10"
+# Add/adjust deps that TRUST and the LangServe adapter need:
+dependencies = [
+  "pandas>=2.0",
+  "pydantic>=2",
+  "fastapi>=0.110",
+  "uvicorn>=0.29",
+  "langserve>=0.3.1",
+  "langchain-core>=0.2",
+  # add your model client(s) here, e.g.:
+  # "openai>=1.40",
+  # "anthropic>=0.34",
+  # plus anything else TRUST imports:
+  # "tiktoken", "python-dotenv", etc.
+]
+
+[tool.setuptools]
+# Explicit package inclusion to avoid “Multiple top-level packages” error
+packages = { find = { include = ["trust*", "langserve_trust*"] } }
+
+# If you need to ship non-.py files (templates/configs), add:
+# [tool.setuptools.package-data]
+# "trust" = ["configs/*.json", "configs/*.yaml", "templates/**/*"]

@@ -1,0 +1,207 @@
+#!/usr/bin/env python
+import os
+import re
+import json
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+from fastapi import FastAPI
+from pydantic import BaseModel
+import inspect
+
+from langserve import add_routes, validation as _ls_validation
+from langchain_core.runnables import RunnableLambda
+
+from langserve_trust.trust_adapter.schemas import (
+    TrustInput, TrustOutput, ChatTurn, ShimQuery, ShimVariable
+)
+from langserve_trust.trust_adapter.runner import TrustRunnable
+
+# --- Path defaults ------------------------------------------------------------
+_THIS_DIR   = Path(__file__).resolve().parent
+_REPO_ROOT  = _THIS_DIR.parent
+_DEFAULT_TEMPLATES_PATH = _REPO_ROOT / "trust" / "agent" / "prompt_templates.json"
+
+DEFAULT_MODEL     = os.getenv("TRUST_MODEL_NAME", "gpt-4o")
+DEFAULT_TEMPLATES = os.getenv("TRUST_TEMPLATE_FILE", str(_DEFAULT_TEMPLATES_PATH))
+DEFAULT_SIM_USER  = os.getenv("TRUST_SIM_USER") or None
+
+trust_runnable = TrustRunnable(
+    model_name=DEFAULT_MODEL,
+    template_file=DEFAULT_TEMPLATES,
+    simulate_user=DEFAULT_SIM_USER,
+)
+
+# --- FastAPI app --------------------------------------------------------------
+app = FastAPI(title="TRUST (LangServe)", version="1.0.0")
+
+# Pydantic 2.11 + langserve 0.3.1 sometimes needs explicit model rebuilds for /docs
+for _, obj in inspect.getmembers(_ls_validation):
+    if isinstance(obj, type) and issubclass(obj, BaseModel):
+        try:
+            obj.model_rebuild()
+        except Exception:
+            pass
+
+# --- Utilities: parse Walit/Emory prompt blob --------------------------------
+_TAGS = [
+    "username",
+    "dialog_topic",
+    "previous_dialogs_summary",
+    "user_questionnaire",
+    "previous_dialog_user_report",
+    "previous_dialog_clinician_report",
+    "previous_dialog_recommendations",
+]
+
+_TAG_RE = re.compile(
+    r"<(?P<tag>{})(?:\s*[^>]*)?>(?P<val>.*?)</\1>".format("|".join(_TAGS)),
+    re.DOTALL | re.IGNORECASE,
+)
+
+def _extract_tagged_sections(txt: str) -> Dict[str, str]:
+    out: Dict[str, str] = {}
+    for m in _TAG_RE.finditer(txt):
+        tag = m.group("tag").lower()
+        out[tag] = m.group("val").strip()
+    return out
+
+def _maybe_json(s: Optional[str]) -> Optional[Any]:
+    if not s:
+        return None
+    s2 = s.strip()
+    # Try raw
+    try:
+        return json.loads(s2)
+    except Exception:
+        pass
+    # Sometimes there are stray CRLF/escapes; try a cleaner
+    s3 = s2.replace("\r\n", "\n")
+    try:
+        return json.loads(s3)
+    except Exception:
+        return None
+
+def _extract_tail_chat_history(txt: str) -> List[ChatTurn]:
+    """
+    The example file sometimes ends with lines like:
+      Human: Hi
+      AI: Hello <username>...
+      Human: ...
+    We turn those into ChatTurn(role, content).
+    Anything not matching is ignored.
+    """
+    turns: List[ChatTurn] = []
+    # Capture the final ~2000 chars to avoid scanning megabyte blobs
+    tail = txt[-20000:]
+    for line in tail.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if line.lower().startswith("human:"):
+            turns.append(ChatTurn(role="user", content=line.split(":", 1)[1].strip()))
+        elif line.lower().startswith(("ai:", "assistant:")):
+            turns.append(ChatTurn(role="assistant", content=line.split(":", 1)[1].strip()))
+    return turns
+
+def _opening_query(dialog_topic: Optional[str], username: Optional[str]) -> str:
+    # If we have a topic, synthesize a kickoff instruction for the agent.
+    if dialog_topic:
+        name = username or "there"
+        return f"Please start a supportive conversation with {name}. Topic: {dialog_topic}"
+    return "Please start a supportive opening."
+
+def _metadata_from_context(parts: Dict[str, str]) -> str:
+    # Keep this human-readable for debugging & trust visibility
+    meta: Dict[str, Any] = {}
+    for k in ["username", "previous_dialogs_summary", "previous_dialog_recommendations"]:
+        if parts.get(k):
+            meta[k] = parts[k]
+    # JSON-ish fields
+    uq = _maybe_json(parts.get("user_questionnaire"))
+    ur = _maybe_json(parts.get("previous_dialog_user_report"))
+    cr = _maybe_json(parts.get("previous_dialog_clinician_report"))
+    if uq: meta["user_questionnaire"] = uq
+    if ur: meta["previous_dialog_user_report"] = ur
+    if cr: meta["previous_dialog_clinician_report"] = cr
+    try:
+        return json.dumps(meta, ensure_ascii=False)
+    except Exception:
+        # Fallback to a rough concatenation if JSON fails for any reason
+        return str(meta)
+
+# --- Emory gateway: translate {"input": "<blob>"} -> TRUST calls ---------------
+def _emory_gateway(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Accepts the Walit/Emory payload {"input": "<big text blob>"} and returns
+    {"output": "<agent text>"} after running TRUST once.
+    """
+    raw = payload.get("input", "") or ""
+    if not raw.strip():
+        return {"output": "No input provided."}
+
+    parts = _extract_tagged_sections(raw)
+    username = parts.get("username")
+    dialog_topic = parts.get("dialog_topic")
+
+    # Build history from any tail transcript
+    history = _extract_tail_chat_history(raw)
+
+    # Build variable (we mainly use metadata to carry rich context)
+    variable = ShimVariable(
+        vid="emory-session",  # any non-empty string is fine
+        metadata=_metadata_from_context(parts) or "",
+        queries=[ShimQuery(question=_opening_query(dialog_topic, username))],
+    )
+
+
+    # Get tags from TRUST using a question seed (topic + last user line if present)
+    seed_questions: List[str] = []
+    if dialog_topic:
+        seed_questions.append(dialog_topic)
+    # If the last turn in history is user, append it as well
+    if history and history[-1].role == "user":
+        seed_questions.append(history[-1].content)
+
+    if not seed_questions:
+        seed_questions = ["Start conversation."]
+
+    # 1) da_tags
+    tags_out = trust_runnable.invoke(TrustInput(
+        op="da_tags",
+        history=history,
+        questions=seed_questions,
+    ))
+    cur_tags: List[str] = tags_out.state.get("tags", []) if isinstance(tags_out, TrustOutput) else []
+
+    # 2) conv_question (single step to produce an agent utterance)
+    result = trust_runnable.invoke(TrustInput(
+        op="conv_question",
+        history=history,
+        variable=variable,
+        cur_query=variable.queries[0],
+        cur_tags=cur_tags,
+    ))
+
+    # Return Emory-shaped response
+    return {"output": result.text if isinstance(result, TrustOutput) else str(result)}
+
+# --- Routes -------------------------------------------------------------------
+# Native TRUST route (kept as-is)
+add_routes(
+    app,
+    trust_runnable.with_types(input_type=TrustInput, output_type=TrustOutput),
+    path="/agent",
+)
+
+# Emory/Walit compatibility route used by walit_client.py
+# (It expects POST /invoke with {"input": "..."} and returns {"output": "..."}.)
+add_routes(
+    app,
+    RunnableLambda(_emory_gateway),
+    path="/emory-logic",
+)
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}

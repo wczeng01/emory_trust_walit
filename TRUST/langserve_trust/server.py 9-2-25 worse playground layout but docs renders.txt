@@ -1,0 +1,119 @@
+#!/usr/bin/env python
+import os
+from pathlib import Path
+
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import HTMLResponse
+from pydantic import ValidationError
+
+from langserve_trust.trust_adapter.schemas import TrustInput, TrustOutput
+from langserve_trust.trust_adapter.runner import TrustRunnable
+
+# ----- resolve defaults -----
+_THIS_DIR  = Path(__file__).resolve().parent
+_REPO_ROOT = _THIS_DIR.parent
+_DEFAULT_TEMPLATES_PATH = _REPO_ROOT / "trust" / "agent" / "prompt_templates.json"
+
+DEFAULT_MODEL     = os.getenv("TRUST_MODEL_NAME", "gpt-4o")
+DEFAULT_TEMPLATES = os.getenv("TRUST_TEMPLATE_FILE", str(_DEFAULT_TEMPLATES_PATH))
+DEFAULT_SIM_USER  = os.getenv("TRUST_SIM_USER") or None
+
+trust_runnable = TrustRunnable(
+    model_name=DEFAULT_MODEL,
+    template_file=DEFAULT_TEMPLATES,
+    simulate_user=DEFAULT_SIM_USER,
+)
+
+app = FastAPI(title="TRUST (minimal)", version="1.0.0")
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+# ----- minimal invoke endpoint (no langserve routers) -----
+@app.post("/agent/invoke", response_model=TrustOutput)
+def agent_invoke(payload: TrustInput):
+    try:
+        # TrustRunnable.invoke already returns TrustOutput
+        return trust_runnable.invoke(payload)
+    except ValidationError as ve:
+        raise HTTPException(status_code=422, detail=ve.errors())
+    except Exception as e:
+        # surface useful error
+        raise HTTPException(status_code=500, detail=str(e))
+
+# ----- super-simple playground so you can test quickly -----
+@app.get("/agent/playground/", response_class=HTMLResponse)
+def playground():
+    return """
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <title>TRUST Playground (minimal)</title>
+  <style>
+    body{font-family:system-ui,Segoe UI,Arial;margin:24px;max-width:900px}
+    textarea,input,select{width:100%;padding:8px;margin:6px 0}
+    pre{background:#f6f8fa;padding:12px;white-space:pre-wrap}
+    .row{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+    button{padding:10px 14px;cursor:pointer}
+    small{color:#666}
+  </style>
+</head>
+<body>
+  <h1>TRUST /agent/invoke</h1>
+  <div class="row">
+    <div>
+      <label>Operation (op)</label>
+      <select id="op">
+        <option value="da_tags">da_tags</option>
+        <option value="conv_transition">conv_transition</option>
+        <option value="conv_question">conv_question</option>
+      </select>
+
+      <label>History (JSON array of {{role, content}})</label>
+      <textarea id="history" rows="6">[]</textarea>
+
+      <label>Questions (for da_tags)</label>
+      <textarea id="questions" rows="4">["What are the main issues?"]</textarea>
+
+      <label>Variable (for conv_*), JSON</label>
+      <textarea id="variable" rows="6">{"vid": "v1", "metadata": null, "queries": [{"question":"example"}]}</textarea>
+
+      <label>cur_query (for conv_question), JSON</label>
+      <textarea id="cur_query" rows="3">{"question":"follow-up?"}</textarea>
+
+      <label>cur_tags (for conv_question), JSON</label>
+      <textarea id="cur_tags" rows="3">["tag1","tag2"]</textarea>
+
+      <button onclick="run()">Invoke</button>
+      <small>POST to <code>/agent/invoke</code></small>
+    </div>
+    <div>
+      <h3>Response</h3>
+      <pre id="out">{ }</pre>
+    </div>
+  </div>
+
+<script>
+async function run(){
+  const body = {
+    op: document.getElementById('op').value,
+    history: JSON.parse(document.getElementById('history').value || "[]"),
+    questions: JSON.parse(document.getElementById('questions').value || "[]"),
+    variable: JSON.parse(document.getElementById('variable').value || "null"),
+    cur_query: JSON.parse(document.getElementById('cur_query').value || "null"),
+    cur_tags: JSON.parse(document.getElementById('cur_tags').value || "null"),
+  };
+  const res = await fetch('/agent/invoke', {
+    method: 'POST',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify(body)
+  });
+  const txt = await res.text();
+  document.getElementById('out').textContent = txt;
+}
+</script>
+</body>
+</html>
+"""

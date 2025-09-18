@@ -1,0 +1,408 @@
+#!/usr/bin/env python
+import os
+import re
+import json
+import logging
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple, Union
+
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel, field_validator, ValidationError
+import inspect
+
+from langserve import add_routes, validation as _ls_validation
+from langchain_core.runnables import RunnableLambda
+
+from langserve_trust.trust_adapter.schemas import (
+    TrustInput, TrustOutput, ChatTurn, ShimQuery, ShimVariable
+)
+from langserve_trust.trust_adapter.runner import TrustRunnable
+
+# --- Path defaults ------------------------------------------------------------
+_THIS_DIR   = Path(__file__).resolve().parent
+_REPO_ROOT  = _THIS_DIR.parent
+_DEFAULT_TEMPLATES_PATH = _REPO_ROOT / "trust" / "agent" / "prompt_templates.json"
+
+DEFAULT_MODEL     = os.getenv("TRUST_MODEL_NAME", "gpt-4o")
+DEFAULT_TEMPLATES = os.getenv("TRUST_TEMPLATE_FILE", str(_DEFAULT_TEMPLATES_PATH))
+DEFAULT_SIM_USER  = os.getenv("TRUST_SIM_USER") or None
+
+trust_runnable = TrustRunnable(
+    model_name=DEFAULT_MODEL,
+    template_file=DEFAULT_TEMPLATES,
+    simulate_user=DEFAULT_SIM_USER,
+)
+
+# --- FastAPI app --------------------------------------------------------------
+app = FastAPI(title="TRUST (LangServe)", version="1.0.0")
+
+# --- logging setup ---
+logger = logging.getLogger("emory-server")
+if not logger.handlers:
+    handler = logging.StreamHandler()
+    fmt = logging.Formatter(
+        "[%(asctime)s] %(levelname)s %(name)s: %(message)s", "%Y-%m-%d %H:%M:%S"
+    )
+    handler.setFormatter(fmt)
+    logger.addHandler(handler)
+logger.setLevel(logging.INFO)
+# ---------------------
+
+# Pydantic 2.11 + langserve 0.3.1 sometimes needs explicit model rebuilds for /docs
+for _, obj in inspect.getmembers(_ls_validation):
+    if isinstance(obj, type) and issubclass(obj, BaseModel):
+        try:
+            obj.model_rebuild()
+        except Exception:
+            pass
+
+# --- Utilities: parse Walit/Emory prompt blob --------------------------------
+_TAGS = [
+    "username",
+    "dialog_topic",
+    "previous_dialogs_summary",
+    "user_questionnaire",
+    "previous_dialog_user_report",
+    "previous_dialog_clinician_report",
+    "previous_dialog_recommendations",
+]
+
+_TAG_RE = re.compile(
+    r"<(?P<tag>{})(?:\s*[^>]*)?>(?P<val>.*?)</\1>".format("|".join(_TAGS)),
+    re.DOTALL | re.IGNORECASE,
+)
+
+def _extract_tagged_sections(txt: str) -> Dict[str, str]:
+    out: Dict[str, str] = {}
+    for m in _TAG_RE.finditer(txt):
+        tag = m.group("tag").lower()
+        out[tag] = m.group("val").strip()
+    return out
+
+def _maybe_json(s: Optional[str]) -> Optional[Any]:
+    if not s:
+        return None
+    s2 = s.strip()
+    # Try raw
+    try:
+        return json.loads(s2)
+    except Exception:
+        pass
+    # Sometimes there are stray CRLF/escapes; try a cleaner
+    s3 = s2.replace("\r\n", "\n")
+    try:
+        return json.loads(s3)
+    except Exception:
+        return None
+
+def _extract_tail_chat_history(txt: str) -> List[ChatTurn]:
+    """
+    The example file sometimes ends with lines like:
+      Human: Hi
+      AI: Hello <username>...
+      Human: ...
+    We turn those into ChatTurn(role, content).
+    Anything not matching is ignored.
+    """
+    turns: List[ChatTurn] = []
+    # Capture the final ~2000 chars to avoid scanning megabyte blobs
+    tail = txt[-20000:]
+    for line in tail.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if line.lower().startswith("human:"):
+            turns.append(ChatTurn(role="user", content=line.split(":", 1)[1].strip()))
+        elif line.lower().startswith(("ai:", "assistant:")):
+            turns.append(ChatTurn(role="assistant", content=line.split(":", 1)[1].strip()))
+    return turns
+
+def _opening_query(dialog_topic: Optional[str], username: Optional[str]) -> str:
+    # If we have a topic, synthesize a kickoff instruction for the agent.
+    if dialog_topic:
+        name = username or "there"
+        return f"Please start a supportive conversation with {name}. Topic: {dialog_topic}"
+    return "Please start a supportive opening."
+    
+class EmoryPromptEnvelope(BaseModel):
+    """Matches your .txt payload shape (PromptWithHistoryAndReports.txt)."""
+    prompts: List[Any]
+
+    @field_validator("prompts")
+    @classmethod
+    def _not_empty(cls, v):
+        if not v:
+            raise ValueError("prompts must be a non-empty list")
+        return v
+
+class EmoryPlaygroundInput(BaseModel):
+    input: str
+
+# add/replace this model
+class EmoryFlexibleInput(BaseModel):
+    input: Union[str, Dict[str, Any]]
+
+class EmoryGatewayInput(BaseModel):
+    payload: Union[Dict[str, Any], str]
+    username: Optional[str] = None
+    model_name: Optional[str] = None
+
+    def normalized(self) -> EmoryPromptEnvelope:
+        data = self.payload
+
+        # 1) Unwrap if caller already sent a dict like {"payload": {...}}
+        if isinstance(data, dict) and "prompts" not in data and "payload" in data:
+            data = data["payload"]
+
+        # 2) If it's a string, parse it
+        if isinstance(data, str):
+            s = data.strip()
+            try:
+                data = json.loads(s)
+            except Exception:
+                # try to salvage a {...} block
+                try:
+                    start = s.index("{"); end = s.rindex("}") + 1
+                    data = json.loads(s[start:end])
+                except Exception as e:
+                    raise ValueError("payload is a string but not valid/parsable JSON") from e
+
+        # 3) Unwrap *again* in case the string parsed into {"payload": "..."} or {"payload": {...}}
+        if isinstance(data, dict) and "prompts" not in data and "payload" in data:
+            inner = data["payload"]
+            # If inner is a string, parse it too
+            if isinstance(inner, str):
+                try:
+                    inner = json.loads(inner)
+                except Exception:
+                    pass
+            data = inner
+
+        # 4) Final validation: must now look like {"prompts": [...]}
+        try:
+            return EmoryPromptEnvelope.model_validate(data)
+        except ValidationError as ve:
+            raise ValueError(f"payload failed validation: {ve}") from ve
+
+class EmoryGatewayOutput(BaseModel):
+    dialog_topic: str
+    tags: List[str]
+    transition_text: str
+    opening_question: str
+
+class WalitResponse(BaseModel):
+    output: EmoryGatewayOutput
+
+def _extract_context_fields(prompt_obj: Dict[str, Any]) -> Tuple[str, List[str], List[str], str]:
+    """
+    Pull fields out of the first item in `prompts`.
+    Returns: (dialog_topic, seed_questions, history, system_prompt)
+    - seed_questions as *strings* (converted later to ShimQuery)
+    - history as role-tagged lines: ["user: ...", "assistant: ...", ...]
+    """
+    # tolerate both snakeCase and kebab-ish keys that your files used
+    system_prompt = prompt_obj.get("system") or prompt_obj.get("System") or ""
+    dialog_topic = prompt_obj.get("dialog_topic") or prompt_obj.get("dialogTopic") or ""
+    history = prompt_obj.get("history") or prompt_obj.get("History") or []
+    # history may be a single string — normalize to list[str]
+    if isinstance(history, str):
+        history = [history]
+
+    # seed questions: accept str list or objects with 'question'
+    sq_raw = (
+        prompt_obj.get("seed_questions")
+        or prompt_obj.get("seedQuestions")
+        or prompt_obj.get("IS_questions")
+        or []
+    )
+    seeds: List[str] = []
+    for q in sq_raw:
+        if isinstance(q, str):
+            seeds.append(q)
+        elif isinstance(q, dict) and "question" in q:
+            seeds.append(str(q["question"]))
+        else:
+            # ignore unrecognized shapes
+            continue
+
+    return str(dialog_topic), seeds, [str(h) for h in history], str(system_prompt)
+
+
+def _metadata_from_context(prompt_obj: Dict[str, Any]) -> str:
+    # stash any structured fields you want to carry through
+    keep_keys = [
+        "previous_dialog_user_reports", "previous_dialog_clinician_reports",
+        "previous_dialog_recommendations", "user_questionnaires",
+        "previous_dialog_summary", "previous_dialogs", "user_profile"
+    ]
+    meta: Dict[str, Any] = {}
+    for k in keep_keys:
+        if k in prompt_obj:
+            meta[k] = prompt_obj[k]
+    return json.dumps(meta, ensure_ascii=False)
+
+# helper to build common kwargs for TrustInput
+def _trust_common_kwargs(model_name: Optional[str]):
+    kw = {
+        "model_name": model_name or DEFAULT_MODEL,
+        "template_file": DEFAULT_TEMPLATES,
+        # do NOT put simulate_user here if it's None
+    }
+    if DEFAULT_SIM_USER is not None and DEFAULT_SIM_USER != "":
+        kw["simulate_user"] = DEFAULT_SIM_USER
+    return kw
+
+def _coerce_prompt_obj(maybe_str: Any) -> Dict[str, Any]:
+    """
+    Accepts either a dict (returns as-is) or a string (attempts to parse/convert).
+    Ensures we return a dict with keys compatible with _extract_context_fields.
+    """
+    if isinstance(maybe_str, dict):
+        return maybe_str
+
+    if isinstance(maybe_str, str):
+        s = maybe_str.strip()
+
+        # 1) try to parse as JSON (raw or salvaged)
+        try:
+            parsed = json.loads(s)
+            if isinstance(parsed, dict):
+                return parsed
+        except Exception:
+            pass
+        try:
+            start = s.index("{"); end = s.rindex("}") + 1
+            parsed = json.loads(s[start:end])
+            if isinstance(parsed, dict):
+                return parsed
+        except Exception:
+            pass
+
+        # 2) fallback: build a minimal object from the raw string
+        parts = _extract_tagged_sections(s)
+        # best-effort history from tail lines like "Human: ..." / "AI: ..."
+        turns = _extract_tail_chat_history(s)
+        history_lines = [t.content for t in turns]
+
+        return {
+            "system": s,  # provide the whole thing to the model if nothing else parsed
+            "dialog_topic": parts.get("dialog_topic", ""),
+            "history": history_lines,
+            "IS_questions": [],
+        }
+
+    # unknown type: force a minimal object
+    return {"system": str(maybe_str), "dialog_topic": "", "history": [], "IS_questions": []}
+
+def _emory_gateway(data: EmoryGatewayInput) -> Dict[str, Any]:
+    """
+    Bridge endpoint for walit_client.py -> TRUST agent.
+    Validates & parses the prompt file, runs TRUST's 3-step flow,
+    and returns a compact response structure.
+    """
+    # --- validate/normalize payload ---
+    try:
+        env = data.normalized()
+    except Exception as e:
+        logger.warning("Payload validation failed: %s", e)
+        raise HTTPException(status_code=400, detail=str(e))
+
+    # We only look at the first prompt entry (your files use a single item)
+    prompt0 = _coerce_prompt_obj(env.prompts[0])
+
+    try:
+        dialog_topic, seed_questions, history, system_prompt = _extract_context_fields(prompt0)
+        # Guarantee at least one IS question for TRUST
+        if not seed_questions:
+            if dialog_topic:
+                seed_questions = [f"Start the conversation about: {dialog_topic}"]
+            else:
+                seed_questions = ["Start the conversation."]
+
+    except Exception as e:
+        logger.exception("Failed to extract context fields")
+        raise HTTPException(status_code=422, detail=f"context extraction failed: {e}")
+
+    username = data.username or prompt0.get("username") or prompt0.get("user") or None
+    
+    # --- build TRUST call pieces ---
+    try:
+        # 1) tag prediction (da_tags)
+        qobjs = [ShimQuery(question=s) for s in seed_questions]
+        # --- 1) tag prediction (da_tags) ---
+        tags_out = trust_runnable.invoke(TrustInput(
+            op="da_tags",
+            history=[ChatTurn(role="system", content=system_prompt)] +
+                    [ChatTurn(role="user", content=h) for h in history],
+            questions=seed_questions,
+            **_trust_common_kwargs(data.model_name),
+        ))
+        tags: List[str] = tags_out.state.get("tags") or []
+
+        # --- 2) transition (conv_transition) ---
+        variable = ShimVariable(
+            vid="",
+            metadata=_metadata_from_context(prompt0),
+            queries=[ShimQuery(question=_opening_query(dialog_topic, username))]
+        )
+        trans_out = trust_runnable.invoke(TrustInput(
+            op="conv_transition",
+            history=[ChatTurn(role="system", content=system_prompt)] +
+                    [ChatTurn(role="user", content=h) for h in history],
+            variable=variable,
+            **_trust_common_kwargs(data.model_name),
+        ))
+
+        # --- 3) opening question (conv_question) ---
+        ask_out = trust_runnable.invoke(TrustInput(
+            op="conv_question",
+            history=[ChatTurn(role="system", content=system_prompt)] +
+                    [ChatTurn(role="user", content=h) for h in history],
+            variable=variable,
+            cur_query=ShimQuery(question=_opening_query(dialog_topic, username)),
+            cur_tags=tags,
+            **_trust_common_kwargs(data.model_name),
+        ))
+    except HTTPException:
+        raise
+    except Exception as e:
+        # don’t leak secrets / request bodies; keep logs internal
+        logger.exception("TRUST pipeline failed")
+        raise HTTPException(status_code=500, detail=f"TRUST pipeline error: {e}")
+
+    # --- success payload ---
+    # keep response small & client-friendly
+    return {
+        "dialog_topic": dialog_topic,
+        "tags": tags,
+        "transition_text": trans_out.text,
+        "opening_question": ask_out.text,
+    }
+
+# --- Routes -------------------------------------------------------------------
+# Native TRUST route (kept as-is)
+add_routes(
+    app,
+    trust_runnable.with_types(input_type=TrustInput, output_type=TrustOutput),
+    path="/agent",
+)
+
+# Emory/Walit compatibility route used by walit_client.py
+# Playground + walit_client both send {"input": "<raw .txt contents>"}.
+# Accepts {"input": "<raw .txt contents>"} from both the SDK client and the Playground
+def _emory_gateway_from_input(x: Dict[str, Any]) -> Dict[str, Any]:
+    payload = x.get("input", "")
+    # produce the classic wrapped shape expected by walit_client.py
+    result_dict = _emory_gateway(EmoryGatewayInput(payload=payload))
+    return {"output": result_dict}
+
+emory_chain = RunnableLambda(_emory_gateway_from_input).with_types(
+    input_type=EmoryPlaygroundInput,   # {"input": str}
+    output_type=WalitResponse          # {"output": {dialog_topic, tags, ...}}
+)
+add_routes(app, emory_chain, path="/emory-logic")
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}

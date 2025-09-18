@@ -1,0 +1,5 @@
+langserve==0.3.1
+langchain
+fastapi
+uvicorn
+pydantic>=2

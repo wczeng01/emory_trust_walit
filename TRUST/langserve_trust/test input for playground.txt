@@ -1,0 +1,17 @@
+{
+  "payload": {
+    "prompts": [
+      {
+        "system": "You are an AI clinician…",
+        "dialog_topic": "In this 30-minute dialog we’ll have a thoughtful conversation about your experiences.",
+        "history": ["Human: Hi"],
+        "IS_questions": [
+          "What brings you in today?",
+          "Have you experienced nightmares or flashbacks?"
+        ]
+      }
+    ]
+  },
+  "username": "Enrico",
+  "model_name": "gpt-4o"
+}

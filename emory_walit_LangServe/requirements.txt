@@ -1,0 +1,9 @@
+# Per eseguire sia il server che il client
+langserve
+langchain-core
+python-dotenv
+
+# Dipendenze specifiche del server
+fastapi
+uvicorn
+sse-starlette
